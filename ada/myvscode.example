@@ -1,0 +1,20 @@
+# Add this function to your ~/.bashrc on Ada (edit paths if needed).
+# Requires you to have OpenVSCode Server unpacked at ~/tools/openvscode/bin/openvscode-server
+
+myvscode() {
+    local PORT="${PORT:-8090}"
+    local HOST
+    HOST=$(hostname -s)
+    echo "[vscode] Starting server on ${HOST} port ${PORT} ..."
+    # Start bound to localhost (safer), no auth token (tunnel provides auth boundary)
+    nohup ~/tools/openvscode/bin/openvscode-server \
+        --host 127.0.0.1 \
+        --port "${PORT}" \
+        --without-connection-token \
+        >/dev/null 2>&1 &
+    sleep 2
+    echo "[vscode] To connect from your laptop, a tunnel will be created by ada-vscode."
+    echo "         Or manually:"
+    echo "  ssh -L ${PORT}:localhost:${PORT} -J <ADA_USER>@ada.iiit.ac.in <ADA_USER>@${HOST}"
+    echo "  then open http://localhost:${PORT}"
+}

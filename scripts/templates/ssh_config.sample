@@ -1,0 +1,25 @@
+# Copy to: ~/.ssh/config
+# Replace <ADA_USER> with your cluster username.
+
+Host ada
+  HostName ada.iiit.ac.in
+  User <ADA_USER>
+  ForwardAgent yes
+  ServerAliveInterval 30
+  ServerAliveCountMax 120
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h:%p
+  ControlPersist 10m
+
+# Any compute node (after you know its name). The client scripts connect programmatically.
+Host gnode-*
+  User <ADA_USER>
+  ProxyJump ada
+  ServerAliveInterval 30
+  ServerAliveCountMax 120
+
+# Convenience: allow short 'ssh gnode047' once a node is assigned
+Host gnode047
+  HostName gnode047
+  User <ADA_USER>
+  ProxyJump ada

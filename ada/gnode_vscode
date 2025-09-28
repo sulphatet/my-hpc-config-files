@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Server-side wrapper to allocate a node, start OpenVSCode Server, and print the node name.
+# Place on Ada as: ~/bin/gnode_vscode  (chmod +x)
+set -euo pipefail
+
+# ---------- Defaults (override via env) ----------
+PARTITION=${PARTITION:-u22}
+ACCOUNT=${ACCOUNT:-research}
+QOS=${QOS:-medium}
+EXCLUDE=${EXCLUDE:-}      # optional; example: "gnode008"
+PORT=${PORT:-8090}
+JOB_NAME=${JOB_NAME:-vscode}
+
+GPUS=${GPUS:-1}
+CPUS=${CPUS:-10}
+MEM=${MEM:-24G}
+TIME=${TIME:-4:00:00}
+
+usage() {
+cat <<EOF
+Usage: gnode_vscode [-g GPUS] [-c CPUS] [-m MEM] [-t TIME] [-p PORT]
+
+Env defaults:
+  PARTITION=${PARTITION}  ACCOUNT=${ACCOUNT}  QOS=${QOS}  EXCLUDE='${EXCLUDE}'  JOB_NAME=${JOB_NAME}
+EOF
+}
+
+while getopts "g:c:m:t:p:h" opt; do
+  case $opt in
+    g) GPUS="$OPTARG" ;;
+    c) CPUS="$OPTARG" ;;
+    m) MEM="$OPTARG" ;;
+    t) TIME="$OPTARG" ;;
+    p) PORT="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+  esac
+done
+
+command -v tmux >/dev/null 2>&1 || { echo "[ERR] tmux is required on Ada"; exit 1; }
+
+# Build srun line (no hard-coded constraint)
+SRUN=(srun -J "${JOB_NAME}" -p "${PARTITION}" -A "${ACCOUNT}" --qos="${QOS}"
+      --gres=gpu:${GPUS} -c "${CPUS}" --mem="${MEM}" --time="${TIME}" --pty)
+# Optional exclude
+[[ -n "${EXCLUDE}" ]] && SRUN+=(--exclude="${EXCLUDE}")
+
+SESSION="vsc-${PORT}"
+
+# Start tmux session that starts vscode and holds the allocation
+tmux new-session -d -s "${SESSION}" "bash -lc '
+  set -euo pipefail
+  ${SRUN[*]} bash -lc \"
+    HOST=\\\$(hostname -s)
+    echo NODE=\\\$HOST
+    echo PORT=${PORT}
+    source ~/.bashrc
+    if ! declare -f myvscode >/dev/null; then
+      echo \"[ERR] myvscode() not found in ~/.bashrc\"; exit 2
+    fi
+    PORT=${PORT} myvscode
+    sleep infinity
+  \"
+'"
+
+# Poll for NODE=...
+NODE=""
+for _ in {1..120}; do
+  NODE=$(tmux capture-pane -pt "${SESSION}" | grep -Eo 'NODE=gnode[0-9]+' | tail -n1 | cut -d= -f2 || true)
+  [[ -n "${NODE}" ]] && break
+  sleep 1
+done
+
+if [[ -z "${NODE}" ]]; then
+  echo "[ERR] Timed out waiting for node assignment. Try: tmux attach -t ${SESSION}"
+  exit 2
+fi
+
+echo "${NODE}"
