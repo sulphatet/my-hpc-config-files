@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Re-exec with bash if invoked by sh
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+set -euo pipefail
+
+# ---- Defaults (overridable by flags) ----
+GPUS=${GPUS:-1}
+CPUS=${CPUS:-10}
+MEM=${MEM:-24G}
+TIME=${TIME:-4:00:00}
+PORT=${PORT:-8090}
+SSD=0
+QUIET=0
+DRYRUN=0
+VERSION="ada-vscode 1.4"
+
+declare -a SYNC_PATHS=()
+
+print_help() {
+  cat <<'EOF'
+ada-vscode — one-shot VS Code on a SLURM cluster (SSH → srun → OpenVSCode → optional rsync → tunnel → browser)
+
+USAGE:
+  ada-vscode [options] [--sync <sub/dir>]...
+
+OPTIONS:
+  -g, --gpus <N>         GPUs to request (default: 1)
+  -c, --cpus <N>         CPUs to request (default: 10)
+  -m, --mem <SIZE>       Total RAM (Slurm syntax) (default: 24G)
+  -t, --time <HH:MM:SS>  Walltime (default: 4:00:00)
+  -p, --port <PORT>      Local & remote OpenVSCode port (default: 8090)
+
+  --sync <sub/dir>       Stage from ada:/share1/<ADA_USER>/<sub/dir> to node-local scratch.
+                         Repeatable. Example: --sync datasets/foo
+  --ssd                  Use /ssd_scratch/<ADA_USER> as the destination root (default: /scratch/<ADA_USER>)
+
+  -q, --quiet            Less output
+  --dry-run              Print actions only
+  -h, --help             Show help and exit
+  -V, --version          Show version and exit
+
+ENV OVERRIDES (advanced):
+  These affect the server-side allocation wrapper (gnode_vscode) without editing it:
+    PARTITION  ACCOUNT  QOS  EXCLUDE  JOB_NAME  PORT
+EOF
+}
+
+log() { [[ "${QUIET}" -eq 0 ]] && echo -e "$*" || true; }
+
+# ---- Parse args (short + long) ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -g|--gpus)  GPUS="$2"; shift 2;;
+    -c|--cpus)  CPUS="$2"; shift 2;;
+    -m|--mem)   MEM="$2";  shift 2;;
+    -t|--time)  TIME="$2"; shift 2;;
+    -p|--port)  PORT="$2"; shift 2;;
+    --sync)     SYNC_PATHS+=("$2"); shift 2;;
+    --ssd)      SSD=1; shift;;
+    -q|--quiet) QUIET=1; shift;;
+    --dry-run)  DRYRUN=1; shift;;
+    -h|--help)  print_help; exit 0;;
+    -V|--version) echo "$VERSION"; exit 0;;
+    -*) echo "[ERR] Unknown option: $1"; print_help; exit 2;;
+    *)  echo "[ERR] Unexpected arg: $1"; print_help; exit 2;;
+  esac
+done
+
+# Prefer autossh if available
+SSH_BIN="ssh"
+if command -v autossh >/dev/null 2>&1; then SSH_BIN="autossh -M 0"; fi
+
+# ---- 1) Ask Ada to allocate and start OpenVSCode ----
+ALLOC_CMD="~/bin/gnode_vscode -g ${GPUS} -c ${CPUS} -m ${MEM} -t ${TIME} -p ${PORT}"
+log "[ada] Requesting node: $ALLOC_CMD"
+if [[ "${DRYRUN}" -eq 1 ]]; then
+  echo "[dry-run] ssh ada \"$ALLOC_CMD\""
+  NODE="gnodeXX"
+else
+  NODE=$(ssh -o StrictHostKeyChecking=accept-new ada "$ALLOC_CMD")
+fi
+[[ -n "${NODE:-}" ]] || { echo "[ERR] No node returned by gnode_vscode"; exit 2; }
+log "[ada] Allocated node: ${NODE}"
+
+# ---- 2) Prime host key for compute node ----
+if [[ "${DRYRUN}" -eq 0 ]]; then
+  ssh -J ada -o StrictHostKeyChecking=accept-new "${NODE}" "echo ok" >/dev/null
+fi
+
+# ---- 3) Optional sync from /share1/<ADA_USER> to {scratch|ssd_scratch} ----
+if [[ "${#SYNC_PATHS[@]}" -gt 0 ]]; then
+  if [[ "${DRYRUN}" -eq 1 ]]; then
+    REMOTE_USER="${ADA_USER:-$USER}"
+  else
+    REMOTE_USER=$(ssh -o StrictHostKeyChecking=accept-new ada 'printf %s "$USER"')
+  fi
+  DEST_ROOT="/scratch/${REMOTE_USER}"
+  [[ "${SSD}" -eq 1 ]] && DEST_ROOT="/ssd_scratch/${REMOTE_USER}"
+  log "[sync] Destination root on ${NODE}: ${DEST_ROOT}"
+  log "[sync] Source root on ada: /share1/${REMOTE_USER}"
+
+  for REL in "${SYNC_PATHS[@]}"; do
+    SRC_PATH="/share1/${REMOTE_USER}/${REL}"
+    SRC="ada:${SRC_PATH}"
+    DEST="${DEST_ROOT}/${REL}"
+    RSYNC_OPTS="-avh --delete --partial --inplace --info=stats2,progress2 --no-inc-recursive"
+    EXCLUDES=(--exclude .git/ --exclude __pycache__/)
+
+    # sanity check source
+    if [[ "${DRYRUN}" -eq 1 ]]; then
+      echo "[dry-run] ssh ada \"test -d '${SRC_PATH}'\""
+      echo "[dry-run] ssh -t -J ada ${NODE} \"mkdir -p '${DEST}' && env RSYNC_RSH=ssh rsync ${RSYNC_OPTS} ${EXCLUDES[*]} '${SRC}/' '${DEST}/'\""
+    else
+      if ! ssh ada "test -d '${SRC_PATH}'"; then
+        echo "[WARN] Source not found on ada: ${SRC_PATH}  (skipping)"
+        continue
+      fi
+      log "[sync] ${SRC}  -->  ${NODE}:${DEST}"
+      ssh -t -J ada "${NODE}" "mkdir -p '${DEST}' && env RSYNC_RSH=ssh rsync ${RSYNC_OPTS} ${EXCLUDES[*]} '${SRC}/' '${DEST}/'"
+    fi
+  done
+fi
+
+# ---- 4) Start local tunnel ----
+if [[ "${DRYRUN}" -eq 1 ]]; then
+  echo "[dry-run] ${SSH_BIN} -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=120 -o StrictHostKeyChecking=accept-new -f -N -L ${PORT}:localhost:${PORT} ${NODE} -J ada"
+else
+  ${SSH_BIN} \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+    -o StrictHostKeyChecking=accept-new \
+    -f -N -L ${PORT}:localhost:${PORT} ${NODE} -J ada
+fi
+log "[ssh] Tunneling localhost:${PORT} -> ${NODE}:${PORT} (via Ada)"
+
+# ---- 5) Probe & open browser ----
+if [[ "${DRYRUN}" -eq 1 ]]; then
+  echo "[dry-run] would probe localhost:${PORT} and open browser"; exit 0
+fi
+
+for _ in {1..60}; do
+  (command -v nc >/dev/null && nc -z localhost "${PORT}") || \
+  (command -v curl >/dev/null && curl -fsS "http://localhost:${PORT}" >/dev/null) || \
+  (bash -lc "</dev/tcp/127.0.0.1/${PORT}" >/dev/null 2>&1) && {
+    log "[ok] VS Code is live at http://localhost:${PORT}"
+    if command -v xdg-open >/dev/null 2>&1; then xdg-open "http://localhost:${PORT}" >/dev/null 2>&1 || true
+    elif command -v open >/dev/null 2>&1; then open "http://localhost:${PORT}" || true
+    fi
+    exit 0
+  }
+  sleep 1
+done
+
+echo "[ERR] Tunnel not responding on localhost:${PORT}."
+echo "      Run:  lsof -i :${PORT}    # should show an ssh/autossh process"
+echo "      Logs: ssh ada 'tmux ls && tmux capture-pane -pt \$(tmux ls -F#S | grep -m1 vsc-) | tail -n 50'"
+exit 3

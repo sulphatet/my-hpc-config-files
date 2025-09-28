@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Re-exec with bash if invoked by sh
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+set -euo pipefail
+
+PORT=${PORT:-8090}
+JOBNAME=${JOBNAME:-vscode}
+SSD=0
+QUIET=0
+DRYRUN=0
+VERSION="ada-vscode-stop 1.2"
+declare -a SYNC_PATHS=()
+NODE_OVERRIDE=""
+
+print_help() {
+  cat <<'EOF'
+ada-vscode-stop — optional sync-back to /share1 + clean shutdown (Slurm job + tunnel)
+
+USAGE:
+  ada-vscode-stop [options] [--sync <sub/dir>]...
+
+OPTIONS:
+  -p, --port <PORT>        Port used by the session (default: 8090)
+  -n, --name <JOBNAME>     Slurm job name to stop (default: vscode)
+  --sync <sub/dir>         Copy from {scratch|ssd_scratch}/<ADA_USER>/<sub/dir> on the node
+                           back to /share1/<ADA_USER>/<sub/dir> on ada (repeatable)
+  --ssd                    Use /ssd_scratch/<ADA_USER> as the source root (default: /scratch/<ADA_USER>)
+  --node <gnodeXX>         Manually specify the node if the job has already ended
+  -q, --quiet              Less output
+  --dry-run                Show actions only
+  -h, --help               Show help and exit
+  -V, --version            Show version and exit
+EOF
+}
+log() { [[ "$QUIET" -eq 0 ]] && echo -e "$*" || true; }
+
+# ---- Parse args ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--port)   PORT="$2"; shift 2;;
+    -n|--name)   JOBNAME="$2"; shift 2;;
+    --sync)      SYNC_PATHS+=("$2"); shift 2;;
+    --ssd)       SSD=1; shift;;
+    --node)      NODE_OVERRIDE="$2"; shift 2;;
+    -q|--quiet)  QUIET=1; shift;;
+    --dry-run)   DRYRUN=1; shift;;
+    -h|--help)   print_help; exit 0;;
+    -V|--version) echo "$VERSION"; exit 0;;
+    -*) echo "[ERR] Unknown option: $1"; print_help; exit 2;;
+    *)  echo "[ERR] Unexpected arg: $1"; print_help; exit 2;;
+  esac
+done
+
+# ---- Figure out remote user on Ada ----
+if [[ "$DRYRUN" -eq 1 ]]; then
+  REMOTE_USER="${ADA_USER:-$USER}"
+else
+  REMOTE_USER=$(ssh -o StrictHostKeyChecking=accept-new ada 'printf %s "$USER"')
+fi
+
+# ---- Work out the node ----
+NODE=""
+if [[ -n "$NODE_OVERRIDE" ]]; then
+  NODE="$NODE_OVERRIDE"
+else
+  if [[ "$DRYRUN" -eq 1 ]]; then
+    NODE="gnodeXX"
+  else
+    read -r JOBID NODE <<<"$(ssh ada "squeue -h -u \$USER --name='${JOBNAME}' -o '%i %N' | head -n1")" || true
+  fi
+fi
+
+# ---- Optional sync back ----
+if [[ "${#SYNC_PATHS[@]}" -gt 0 ]]; then
+  if [[ -z "${NODE:-}" ]]; then
+    echo "[ERR] Could not determine node for job '${JOBNAME}'. Provide --node gnodeXX"
+    exit 2
+  fi
+
+  SRC_ROOT="/scratch/${REMOTE_USER}"
+  [[ "$SSD" -eq 1 ]] && SRC_ROOT="/ssd_scratch/${REMOTE_USER}"
+
+  RSYNC_OPTS="-avh --delete --partial --inplace --info=stats2,progress2 --no-inc-recursive"
+  EXCLUDES=(--exclude .git/ --exclude __pycache__/)
+
+  for REL in "${SYNC_PATHS[@]}"; do
+    SRC="${NODE}:${SRC_ROOT}/${REL}/"
+    DEST="/share1/${REMOTE_USER}/${REL}/"
+
+    if [[ "$DRYRUN" -eq 1 ]]; then
+      echo "[dry-run] ssh ada \"mkdir -p '${DEST}'\""
+      echo "[dry-run] ssh ada \"rsync ${RSYNC_OPTS} ${EXCLUDES[*]} '${SRC}' '${DEST}'\""
+    else
+      log "[sync-back] ${SRC}  -->  ada:${DEST}"
+      ssh ada "mkdir -p '${DEST}'"
+      ssh ada "rsync ${RSYNC_OPTS} ${EXCLUDES[*]} '${SRC}' '${DEST}'"
+    fi
+  done
+fi
+
+# ---- Cancel Slurm job(s) named JOBNAME ----
+if [[ "$DRYRUN" -eq 1 ]]; then
+  echo "[dry-run] ssh ada \"squeue -u \$USER --name='${JOBNAME}' -o '%i' | tail -n +2 | xargs -r scancel\""
+else
+  log "[stop] Cancelling Slurm job(s) named '${JOBNAME}' (if any)"
+  ssh ada "squeue -u \$USER --name='${JOBNAME}' -o '%i' | tail -n +2 | xargs -r scancel" || true
+fi
+
+# ---- Kill local tunnel ----
+TUN_PAT="ssh.*-L ${PORT}:localhost:${PORT}"
+if [[ "$DRYRUN" -eq 1 ]]; then
+  echo "[dry-run] pkill -f \"${TUN_PAT}\" || true"
+else
+  log "[stop] Killing local tunnel on port ${PORT}"
+  pkill -f "${TUN_PAT}" || true
+fi
+
+log "[ok] VS Code allocation and tunnel shut down."
